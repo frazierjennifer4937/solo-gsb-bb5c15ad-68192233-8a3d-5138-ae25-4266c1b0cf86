@@ -33,6 +33,16 @@
     absorbed: "父路径被整体替换/删除，该发现是其下游影响",
     same_cause: "共享/循环组件在多处引用产生的同一根因",
   };
+  const EXEMPTION_STATUS = {
+    active: "🛡️ 豁免生效中",
+    expired: "⏰ 豁免已过期",
+    revoked: "🚫 豁免已撤销",
+  };
+  const EXEMPTION_BADGE = {
+    active: "🛡️ 已豁免",
+    expired: "⏰ 豁免过期",
+    revoked: "🚫 豁免撤销",
+  };
 
   // ------------------------------------------------------------------ //
   // Tab 切换
@@ -123,6 +133,7 @@
           new_spec: newSpec,
           old_filename: $("#old-filename").textContent || null,
           new_filename: $("#new-filename").textContent || null,
+          api_id: $("#api-id-input").value.trim() || null,
         }),
       });
       const data = await resp.json();
@@ -183,6 +194,8 @@
     }
 
     renderStats();
+    renderExemptionBar();
+    $("#api-id-input").value = r.api_id || "";
     populateCategoryFilter();
     bindFiltersOnce();
     syncFilterControls();
@@ -210,6 +223,138 @@
         ? state.review.summary.total
         : (state.review.summary.counts[key] || 0);
     });
+  }
+
+  // ------------------------------------------------------------------ //
+  // 限时豁免（创建 / 撤销 / API 标识 / 放行结论）
+  // ------------------------------------------------------------------ //
+  function renderExemptionBar() {
+    const r = state.review;
+    const bar = $("#exemption-bar");
+    if (!r || !r.exemption_summary) {
+      bar.classList.add("hidden");
+      return;
+    }
+    const s = r.exemption_summary;
+    const apiId = r.api_id || "";
+    let html = `<div class="ex-row">
+      <span class="ex-api-label">API 标识：<b>${apiId ? escapeHtml(apiId) : "（未设置）"}</b></span>
+      <input type="text" id="api-id-edit" placeholder="API 标识（用于豁免匹配）"
+        value="${escapeAttr(apiId)}" title="保存后按该标识重新匹配豁免；清空则不应用豁免" />
+      <button id="api-id-save" class="mini-btn ex-save" title="保存 API 标识">保存</button>
+      ${s.applied ? "" : '<span class="ex-hint">未设置标识的审查不应用任何豁免</span>'}
+    </div>`;
+    html += `<div class="ex-row ex-counts">
+      <span class="pill ${s.releasable ? "good" : "bad"}">${escapeHtml(s.conclusion)}</span>
+      <span class="ex-stat">破坏 <b>${s.breaking_total}</b></span>
+      <span class="ex-stat ok">🛡️ 已豁免 <b>${s.exempted}</b></span>
+      <span class="ex-stat warn">⚠️ 未豁免 <b>${s.unexempted}</b></span>
+    </div>`;
+    const rows = r.exemptions || [];
+    if (rows.length) {
+      html += `<details class="ex-list"><summary>豁免记录（${rows.length}）</summary>` +
+        rows.map(exemptionRowHtml).join("") + "</details>";
+    }
+    bar.innerHTML = html;
+    bar.classList.remove("hidden");
+    $("#api-id-save").addEventListener("click", saveApiId);
+    bar.querySelectorAll("[data-ex-revoke]").forEach((btn) =>
+      btn.addEventListener("click", () => revokeExemption(Number(btn.dataset.exRevoke))));
+  }
+
+  function exemptionRowHtml(row) {
+    const st = EXEMPTION_STATUS[row.status] || row.status;
+    return `<div class="ex-record ${row.status}">
+      <span class="ex-pill ${row.status}">${st}</span>
+      <span class="ex-rec-main">
+        ${row.endpoint ? `<span class="finding-endpoint">${escapeHtml(row.endpoint)}</span>` : ""}
+        <code>${escapeHtml(row.rule_id || "")}</code>
+        <span class="ex-loc">📍 ${escapeHtml(row.location || "")}</span>
+      </span>
+      <span class="ex-rec-meta">理由：${escapeHtml(row.reason || "—")} · 到期（UTC）：${escapeHtml(row.expires_at || "—")}${row.matched ? " · 命中当前发现" : " · 未命中当前发现"}${row.revoked_at ? ` · 撤销于 ${escapeHtml(row.revoked_at)}` : ""}</span>
+      ${row.status === "active" ? `<button class="mini-link ex-revoke" data-ex-revoke="${row.id}" title="撤销该豁免，撤销后立即失效">撤销</button>` : ""}
+    </div>`;
+  }
+
+  /** 豁免 / 标识变更后的轻量刷新：不重置视图与筛选，仅重算展示。 */
+  function applyReviewUpdate(data) {
+    state.review = data;
+    (data.findings || []).forEach((f, i) => { if (f.id == null) f.id = i + 1; });
+    $("#api-id-input").value = data.api_id || "";
+    renderStats();
+    renderExemptionBar();
+    renderCurrentView();
+  }
+
+  async function saveApiId() {
+    if (!state.review || !state.review.id) return;
+    const apiId = $("#api-id-edit").value.trim();
+    try {
+      const resp = await fetch(`/api/reviews/${state.review.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ api_id: apiId || null }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        showError(data.detail || `保存 API 标识失败（HTTP ${resp.status}）`);
+        return;
+      }
+      hideError();
+      applyReviewUpdate(data);
+    } catch (err) {
+      showError(`保存 API 标识失败：${err.message}`);
+    }
+  }
+
+  async function createExemption(findingId, box) {
+    if (!state.review || !state.review.id) return;
+    const reason = box.querySelector(".ex-reason-input").value.trim();
+    const expiresLocal = box.querySelector(".ex-expires-input").value;
+    if (!reason) { showError("请填写豁免理由。"); return; }
+    if (!expiresLocal) { showError("请选择 UTC 到期时间。"); return; }
+    // datetime-local 输入按 UTC 解释（输入框旁已标注 UTC）
+    const expires = new Date(`${expiresLocal}Z`);
+    if (Number.isNaN(expires.getTime())) { showError("到期时间格式无效。"); return; }
+    try {
+      const resp = await fetch(`/api/reviews/${state.review.id}/exemptions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          finding_id: findingId,
+          reason,
+          expires_at: expires.toISOString(),
+        }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        showError(data.detail || `创建豁免失败（HTTP ${resp.status}）`);
+        return;
+      }
+      hideError();
+      applyReviewUpdate(data);
+    } catch (err) {
+      showError(`创建豁免失败：${err.message}`);
+    }
+  }
+
+  async function revokeExemption(exemptionId) {
+    if (!state.review || !state.review.id) return;
+    if (!confirm("确定撤销该豁免？撤销后立即失效。")) return;
+    try {
+      const resp = await fetch(
+        `/api/reviews/${state.review.id}/exemptions/${exemptionId}/revoke`,
+        { method: "POST" });
+      const data = await resp.json();
+      if (!resp.ok) {
+        showError(data.detail || `撤销豁免失败（HTTP ${resp.status}）`);
+        return;
+      }
+      hideError();
+      applyReviewUpdate(data);
+    } catch (err) {
+      showError(`撤销豁免失败：${err.message}`);
+    }
   }
 
   function populateCategoryFilter() {
@@ -308,7 +453,7 @@
     bindFindingInteractions(list);
   }
 
-  /** 绑定发现卡片内的交互：引用树跳转 + 最小复现包导出（两种视图共用）。 */
+  /** 绑定发现卡片内的交互：引用树跳转 + 最小复现包导出 + 豁免（两种视图共用）。 */
   function bindFindingInteractions(root) {
     root.querySelectorAll("[data-tree-pointer]").forEach((el) => {
       el.addEventListener("click", (e) => {
@@ -322,6 +467,18 @@
       btn.addEventListener("click", (e) => {
         e.stopPropagation();
         downloadRepro(Number(btn.dataset.repro), btn);
+      });
+    });
+    root.querySelectorAll("[data-ex-create]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        createExemption(Number(btn.dataset.exCreate), btn.closest(".exemption-box"));
+      });
+    });
+    root.querySelectorAll("[data-ex-revoke]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        revokeExemption(Number(btn.dataset.exRevoke));
       });
     });
   }
@@ -358,6 +515,7 @@
       </div>
       ${hasValues ? `<div class="value-diff">${oldVal}${newVal}</div>` : ""}
       <div class="rule-id">rule: ${escapeHtml(f.rule_id)} · 方向：${DIRECTION_LABEL[f.direction] || f.direction} · 分类：${escapeHtml(f.category)}</div>
+      ${f.severity === "breaking" ? exemptionBlockHtml(f) : ""}
       <div class="repro-row">
         <button class="mini-link repro-btn" data-repro="${f.id}"
           title="裁剪新旧文档，仅保留该发现所属路径/操作及其传递引用的组件，打包 ZIP 下载">📦 导出最小复现包</button>
@@ -365,8 +523,43 @@
       </div>`;
   }
 
+  /** 破坏项的豁免区块：匹配状态 / 理由 / 到期时间 + 创建表单（需已设置 API 标识）。 */
+  function exemptionBlockHtml(f) {
+    const hasApiId = !!(state.review && state.review.api_id);
+    const ex = f.exemption || null;
+    let html = '<div class="exemption-box">';
+    if (ex) {
+      html += `<div class="ex-status ${ex.status}">`
+        + `<span class="ex-pill ${ex.status}">${EXEMPTION_STATUS[ex.status] || ex.status}</span>`
+        + ` <span class="ex-detail">理由：${escapeHtml(ex.reason || "—")}</span>`
+        + ` <span class="ex-detail">到期（UTC）：${escapeHtml(ex.expires_at || "—")}</span>`
+        + (ex.revoked_at ? ` <span class="ex-detail">撤销于（UTC）：${escapeHtml(ex.revoked_at)}</span>` : "")
+        + (ex.status === "active"
+          ? ` <button class="mini-link ex-revoke" data-ex-revoke="${ex.id}" title="撤销该豁免，撤销后立即失效">撤销豁免</button>`
+          : "")
+        + "</div>";
+    } else {
+      html += `<div class="ex-status none">未豁免${hasApiId ? "" : "（审查未设置 API 标识，豁免不适用）"}</div>`;
+    }
+    if (hasApiId) {
+      html += `<div class="ex-form">
+        <input type="text" class="ex-reason-input" placeholder="豁免理由（必填）" maxlength="200" />
+        <input type="datetime-local" class="ex-expires-input" title="UTC 到期时间（须为未来时间）" />
+        <span class="ex-tz">UTC</span>
+        <button class="mini-link ex-create" data-ex-create="${f.id}"
+          title="按 规则+方向+端点+位置+新旧值 匹配该破坏项，到期或撤销后自动失效">＋ 创建限时豁免</button>
+      </div>`;
+    }
+    return html + "</div>";
+  }
+
   function findingCard(f) {
     const bodyHidden = state.expandedFinding === f.id ? "" : "hidden";
+    const exBadge = f.severity === "breaking" && f.exemption
+      ? `<span class="ex-badge ${f.exemption.status}"
+          title="${escapeAttr(EXEMPTION_STATUS[f.exemption.status] || "")}：${escapeAttr(f.exemption.reason || "")}，到期（UTC）${escapeAttr(f.exemption.expires_at || "—")}"
+        >${EXEMPTION_BADGE[f.exemption.status] || ""}</span>`
+      : "";
 
     return `
     <article class="finding ${f.severity}" data-id="${f.id}">
@@ -375,6 +568,7 @@
         ${f.endpoint ? `<span class="finding-endpoint">${escapeHtml(f.endpoint)}</span>` : ""}
         <p class="finding-msg">${escapeHtml(f.message)}</p>
         <span class="finding-meta">
+          ${exBadge}
           <span class="change-tag">${CHANGE_LABEL[f.change] || f.change}</span>
           ${refButtons(f)}
         </span>

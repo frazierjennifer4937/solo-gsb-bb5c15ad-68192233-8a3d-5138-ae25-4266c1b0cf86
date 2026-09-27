@@ -1,6 +1,7 @@
-"""FastAPI 入口：审查、历史、引用展开树、根因聚合、破坏项对账、报告下载、最小复现包导出。"""
+"""FastAPI 入口：审查、历史、引用展开树、根因聚合、破坏项对账、限时豁免、报告下载、最小复现包导出。"""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -11,8 +12,8 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import database, groups, reconcile, reports, repro
-from .diff import run_diff, summarize
+from . import database, exemptions, groups, reconcile, reports, repro
+from .diff import BREAKING, run_diff, summarize
 from .parser import SpecParseError, load_spec
 from .refs import build_ref_tree, expand_path_to_pointer, list_root_pointers
 
@@ -50,6 +51,17 @@ class ReviewRequest(BaseModel):
     old_filename: str | None = None
     new_filename: str | None = None
     title: str | None = None
+    api_id: str | None = Field(None, description="API 标识（用于限时豁免匹配；留空则不应用豁免）")
+
+
+class ApiIdUpdate(BaseModel):
+    api_id: str | None = Field(None, description="API 标识；空串或 null 表示清除")
+
+
+class ExemptionCreate(BaseModel):
+    finding_id: int = Field(..., description="破坏项发现序号 id")
+    reason: str = Field(..., description="豁免理由（必填）")
+    expires_at: str = Field(..., description="UTC 到期时间（ISO 8601，须为未来时间）")
 
 
 def _version_of(doc: dict[str, Any]) -> str | None:
@@ -57,6 +69,21 @@ def _version_of(doc: dict[str, Any]) -> str | None:
     if isinstance(info, dict) and info.get("version"):
         return str(info["version"])
     return None
+
+
+def _norm_api_id(value: str | None) -> str | None:
+    """API 标识规范化：去空白，空串视为未设置。"""
+    return (value or "").strip() or None
+
+
+def _enriched_review(review_id: int) -> dict[str, Any] | None:
+    """读取审查并叠加豁免视图（每次读取按当前时间重新计算，不改库存储）。"""
+    review = database.get_review(review_id)
+    if review is None:
+        return None
+    api_id = _norm_api_id(review.get("api_id"))
+    rows = database.list_exemptions(api_id) if api_id else []
+    return exemptions.apply_to_review(review, rows)
 
 
 # ---------------------------------------------------------------------- #
@@ -87,19 +114,13 @@ def create_review(req: ReviewRequest) -> dict[str, Any]:
         new_filename=req.new_filename,
         old_version=_version_of(old_doc),
         new_version=_version_of(new_doc),
+        api_id=_norm_api_id(req.api_id),
         summary=summary_data,
         findings=findings,
         old_doc=old_doc,
         new_doc=new_doc,
     )
-    return {
-        "id": review_id,
-        "title": title,
-        "old_version": _version_of(old_doc),
-        "new_version": _version_of(new_doc),
-        "summary": summary_data,
-        "findings": findings,
-    }
+    return _enriched_review(review_id)
 
 
 @app.get("/api/reviews")
@@ -109,10 +130,19 @@ def get_reviews() -> dict[str, Any]:
 
 @app.get("/api/reviews/{review_id}")
 def get_review(review_id: int) -> dict[str, Any]:
-    review = database.get_review(review_id)
+    review = _enriched_review(review_id)
     if review is None:
         raise HTTPException(status_code=404, detail="审查记录不存在")
     return review
+
+
+@app.patch("/api/reviews/{review_id}")
+def update_review_api_id(review_id: int, req: ApiIdUpdate) -> dict[str, Any]:
+    """设置 / 清除审查的 API 标识；保存后按该标识重新匹配豁免。"""
+    if database.get_review(review_id) is None:
+        raise HTTPException(status_code=404, detail="审查记录不存在")
+    database.set_api_id(review_id, _norm_api_id(req.api_id))
+    return _enriched_review(review_id)
 
 
 @app.delete("/api/reviews/{review_id}", status_code=204)
@@ -120,6 +150,75 @@ def remove_review(review_id: int) -> Response:
     if not database.delete_review(review_id):
         raise HTTPException(status_code=404, detail="审查记录不存在")
     return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------- #
+# 限时豁免（按 API 标识 + 语义指纹匹配破坏项，到期 / 撤销即失效）
+# ---------------------------------------------------------------------- #
+@app.post("/api/reviews/{review_id}/exemptions", status_code=201)
+def create_exemption(review_id: int, req: ExemptionCreate) -> dict[str, Any]:
+    """为审查中的某条破坏性发现创建限时豁免。
+
+    匹配键（规则 / 方向 / 端点 / 语义位置 / 新旧值）由服务端从发现项计算，
+    与发现序号无关；到期时间须为未来的 UTC 时间。返回叠加豁免视图后的审查。
+    """
+    review = database.get_review(review_id)
+    if review is None:
+        raise HTTPException(status_code=404, detail="审查记录不存在")
+    api_id = _norm_api_id(review.get("api_id"))
+    if not api_id:
+        raise HTTPException(
+            status_code=400,
+            detail="该审查未设置 API 标识，不能创建豁免；请先为审查填写 API 标识。",
+        )
+
+    finding = repro.find_finding(review["findings"], req.finding_id)
+    if finding is None:
+        raise HTTPException(status_code=404, detail="发现项不存在")
+    if finding.get("severity") != BREAKING:
+        raise HTTPException(status_code=400, detail="仅破坏性变更可以创建豁免。")
+
+    reason = (req.reason or "").strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="请填写豁免理由。")
+    try:
+        expires = exemptions.parse_utc(req.expires_at)
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=400,
+            detail="到期时间格式无效，请使用 ISO 8601 UTC 时间（如 2026-10-01T00:00:00Z）。",
+        )
+    if expires <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="到期时间必须是未来的 UTC 时间。")
+
+    key = exemptions.finding_match_key(finding)
+    database.create_exemption(
+        api_id=api_id,
+        rule_id=key[0],
+        direction=key[1],
+        endpoint=key[2],
+        location=key[3],
+        old_value=key[4],
+        new_value=key[5],
+        reason=reason,
+        expires_at=exemptions.format_utc(expires),
+    )
+    return _enriched_review(review_id)
+
+
+@app.post("/api/reviews/{review_id}/exemptions/{exemption_id}/revoke")
+def revoke_exemption(review_id: int, exemption_id: int) -> dict[str, Any]:
+    """撤销豁免（保留记录，撤销后立即失效）。返回叠加豁免视图后的审查。"""
+    review = database.get_review(review_id)
+    if review is None:
+        raise HTTPException(status_code=404, detail="审查记录不存在")
+    row = database.get_exemption(exemption_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="豁免记录不存在")
+    if row["api_id"] != (_norm_api_id(review.get("api_id")) or ""):
+        raise HTTPException(status_code=400, detail="该豁免不属于此审查的 API 标识。")
+    database.revoke_exemption(exemption_id)
+    return _enriched_review(review_id)
 
 
 # ---------------------------------------------------------------------- #
@@ -218,7 +317,7 @@ def get_tree(
 # ---------------------------------------------------------------------- #
 @app.get("/api/reviews/{review_id}/report")
 def download_report(review_id: int, format: str = "markdown") -> Response:
-    review = database.get_review(review_id)
+    review = _enriched_review(review_id)
     if review is None:
         raise HTTPException(status_code=404, detail="审查记录不存在")
 

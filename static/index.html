@@ -65,6 +65,9 @@
           <button class="link-btn" data-sample="enum">枚举/约束收窄</button>
         </div>
         <div class="actions-right">
+          <input type="text" id="api-id-input" class="api-id-input"
+            placeholder="API 标识（可选，用于豁免）"
+            title="用于限时豁免匹配；留空则该审查不应用任何豁免" />
           <button id="clear-btn" class="ghost-btn">清空</button>
           <button id="compare-btn" class="primary-btn">开始审查 →</button>
         </div>
@@ -87,6 +90,8 @@
         </div>
 
         <div class="stat-cards" id="stat-cards"></div>
+
+        <div id="exemption-bar" class="exemption-bar hidden"></div>
 
         <div class="filters">
           <div class="filter-group" id="severity-filters">
