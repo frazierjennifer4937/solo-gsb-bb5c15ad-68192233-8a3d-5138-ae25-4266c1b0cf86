@@ -1,4 +1,4 @@
-"""FastAPI 入口：审查、历史、引用展开树、根因聚合、破坏项对账、报告下载、最小复现包导出。"""
+"""FastAPI 入口：审查、历史、引用展开树、根因聚合、破坏项对账、限时豁免、报告下载、最小复现包导出。"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import database, groups, reconcile, reports, repro
+from . import database, exemptions, groups, reconcile, reports, repro
 from .diff import run_diff, summarize
 from .parser import SpecParseError, load_spec
 from .refs import build_ref_tree, expand_path_to_pointer, list_root_pointers
@@ -50,6 +50,17 @@ class ReviewRequest(BaseModel):
     old_filename: str | None = None
     new_filename: str | None = None
     title: str | None = None
+    api_id: str | None = Field(
+        default=None, description="API 标识（可选）；填写后才可创建并应用限时豁免"
+    )
+
+
+class ExemptionRequest(BaseModel):
+    finding_id: int = Field(..., description="要豁免的破坏项发现序号（仅用于定位发现）")
+    reason: str = Field(..., description="豁免理由（必填）")
+    expires_at: str = Field(
+        ..., description="UTC 到期时间（ISO 8601，须晚于当前时间），到达即失效"
+    )
 
 
 def _version_of(doc: dict[str, Any]) -> str | None:
@@ -57,6 +68,13 @@ def _version_of(doc: dict[str, Any]) -> str | None:
     if isinstance(info, dict) and info.get("version"):
         return str(info["version"])
     return None
+
+
+def _with_exemptions(review: dict[str, Any]) -> dict[str, Any]:
+    """读取时实时叠加豁免覆盖层（原始发现、统计与历史对账保持原样）。"""
+    api_id = str(review.get("api_id") or "").strip()
+    records = database.list_exemptions(api_id) if api_id else []
+    return exemptions.apply_exemptions(review, records)
 
 
 # ---------------------------------------------------------------------- #
@@ -80,6 +98,7 @@ def create_review(req: ReviewRequest) -> dict[str, Any]:
         f"{new_doc.get('info', {}).get('title', 'API')} "
         f"{_version_of(old_doc) or '旧版'} → {_version_of(new_doc) or '新版'}"
     )
+    api_id = (req.api_id or "").strip() or None
 
     review_id = database.create_review(
         title=title,
@@ -87,19 +106,15 @@ def create_review(req: ReviewRequest) -> dict[str, Any]:
         new_filename=req.new_filename,
         old_version=_version_of(old_doc),
         new_version=_version_of(new_doc),
+        api_id=api_id,
         summary=summary_data,
         findings=findings,
         old_doc=old_doc,
         new_doc=new_doc,
     )
-    return {
-        "id": review_id,
-        "title": title,
-        "old_version": _version_of(old_doc),
-        "new_version": _version_of(new_doc),
-        "summary": summary_data,
-        "findings": findings,
-    }
+    review = database.get_review(review_id)
+    assert review is not None  # 刚写入
+    return _with_exemptions(review)
 
 
 @app.get("/api/reviews")
@@ -112,7 +127,7 @@ def get_review(review_id: int) -> dict[str, Any]:
     review = database.get_review(review_id)
     if review is None:
         raise HTTPException(status_code=404, detail="审查记录不存在")
-    return review
+    return _with_exemptions(review)
 
 
 @app.delete("/api/reviews/{review_id}", status_code=204)
@@ -123,6 +138,68 @@ def remove_review(review_id: int) -> Response:
 
 
 # ---------------------------------------------------------------------- #
+# 限时豁免（按 API 标识匹配，读取审查时实时重算状态）
+# ---------------------------------------------------------------------- #
+@app.post("/api/reviews/{review_id}/exemptions", status_code=201)
+def create_exemption(review_id: int, req: ExemptionRequest) -> dict[str, Any]:
+    """对某条破坏性发现登记限时豁免：理由 + 未来的 UTC 到期时间。
+
+    豁免记录的是发现的语义身份（规则 / 方向 / 端点 / 语义位置 / 新旧值），
+    而非发现序号——同一 API 标识的后续审查中完全相同的发现才会被覆盖。
+    """
+    review = database.get_review(review_id)
+    if review is None:
+        raise HTTPException(status_code=404, detail="审查记录不存在")
+    api_id = str(review.get("api_id") or "").strip()
+    if not api_id:
+        raise HTTPException(
+            status_code=400,
+            detail="该审查未设置 API 标识，无法创建豁免（无标识的审查不应用豁免）",
+        )
+    finding = repro.find_finding(review["findings"], req.finding_id)
+    if finding is None:
+        raise HTTPException(status_code=404, detail="发现项不存在")
+    if finding.get("severity") != "breaking":
+        raise HTTPException(status_code=422, detail="仅破坏性发现可以登记豁免")
+    reason = (req.reason or "").strip()
+    if not reason:
+        raise HTTPException(status_code=422, detail="豁免理由不能为空")
+    try:
+        expires_at = exemptions.parse_future_utc(req.expires_at)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    record = database.create_exemption(
+        api_id=api_id,
+        rule_id=str(finding.get("rule_id") or ""),
+        direction=str(finding.get("direction") or ""),
+        endpoint=str(finding.get("endpoint") or ""),
+        location=str(finding.get("location") or ""),
+        old_value=exemptions.canonical_value(finding.get("old_value")),
+        new_value=exemptions.canonical_value(finding.get("new_value")),
+        reason=reason,
+        expires_at=expires_at,
+        created_at=exemptions.format_utc(exemptions.now_utc()),
+    )
+    record["status"] = exemptions.exemption_status(record)
+    record["status_label"] = exemptions.STATUS_CN[record["status"]]
+    return record
+
+
+@app.post("/api/exemptions/{exemption_id}/revoke")
+def revoke_exemption(exemption_id: int) -> dict[str, Any]:
+    """撤销豁免（立即失效，幂等）；豁免状态在读取审查时重新计算。"""
+    record = database.revoke_exemption(
+        exemption_id, exemptions.format_utc(exemptions.now_utc())
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="豁免记录不存在")
+    record["status"] = exemptions.exemption_status(record)
+    record["status_label"] = exemptions.STATUS_CN[record["status"]]
+    return record
+
+
+# ---------------------------------------------------------------------- #
 # 根因聚合（有向影响组）
 # ---------------------------------------------------------------------- #
 @app.get("/api/reviews/{review_id}/groups")
@@ -130,6 +207,8 @@ def get_review_groups(review_id: int) -> dict[str, Any]:
     review = database.get_review(review_id)
     if review is None:
         raise HTTPException(status_code=404, detail="审查记录不存在")
+    # 叠加豁免信息，使聚合视图的发现详情同样展示匹配状态
+    review = _with_exemptions(review)
     result = groups.build_impact_groups(review["findings"])
     result["review_id"] = review_id
     return result
@@ -221,6 +300,7 @@ def download_report(review_id: int, format: str = "markdown") -> Response:
     review = database.get_review(review_id)
     if review is None:
         raise HTTPException(status_code=404, detail="审查记录不存在")
+    review = _with_exemptions(review)
 
     safe_title = (review.get("title") or f"review-{review_id}")
     safe_title = "".join(c for c in safe_title if c.isalnum() or c in ("-", "_", " ", "."))

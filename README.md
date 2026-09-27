@@ -1,6 +1,6 @@
 # 🔎 OpenAPI 版本兼容性审查工具
 
-对比新旧两份 **OpenAPI 3.x**（JSON / YAML）文档，递归解析 `$ref`（**支持循环引用**）、合并 `allOf`，按**请求 / 响应两个方向**的语义规则判断每一处变更是否向后兼容，精确定位破坏性变更的 JSON 路径并给出原因。支持结果筛选、**根因聚合视图**（有向影响组）、引用展开树浏览、审查报告下载、**单条发现的最小复现包导出**、历史记录与**破坏项对账**（基线审查 vs 当前审查）。
+对比新旧两份 **OpenAPI 3.x**（JSON / YAML）文档，递归解析 `$ref`（**支持循环引用**）、合并 `allOf`，按**请求 / 响应两个方向**的语义规则判断每一处变更是否向后兼容，精确定位破坏性变更的 JSON 路径并给出原因。支持结果筛选、**根因聚合视图**（有向影响组）、引用展开树浏览、审查报告下载、**单条发现的最小复现包导出**、历史记录与**破坏项对账**（基线审查 vs 当前审查），以及**限时豁免**：按 API 标识对破坏项登记带 UTC 到期时间的豁免，读取审查时实时重算匹配状态。
 
 技术栈：**FastAPI + SQLite + 原生 JavaScript**（前端零构建、零框架依赖）。
 
@@ -18,7 +18,7 @@ docker compose up -d --build
 
 > **http://localhost:8000**
 
-端口说明：容器内监听 `8000`，通过 `docker-compose.yml` 映射到宿主机 **8000**；审查数据保存在 Docker 卷 `review-data`（容器内 `/data/reviews.db`），重启不丢失。镜像内置 `HEALTHCHECK`，周期性探测 `GET /api/health`，可通过 `docker ps` 查看健康状态。
+端口说明：容器内监听 `8000`，通过 `docker-compose.yml` 映射到宿主机 **8000**；审查数据保存在 Docker 卷 `review-data`（容器内 `/data/reviews.db`），重启不丢失。应用启动时自动完成建表与数据库结构升级（如新增 `api_id` 列、`exemptions` 表），无需手工迁移。镜像内置 `HEALTHCHECK`，周期性探测 `GET /api/health`，可通过 `docker ps` 查看健康状态。
 
 停止 / 更新：
 
@@ -43,17 +43,19 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 1. 打开 http://localhost:8000 ，在左右两栏**粘贴**或点击「上传」选择旧版 / 新版 OpenAPI 文件（`.json` / `.yaml` / `.yml` 均可，也可混用）。
 2. 可先点击内置示例：**典型破坏性变更 / 循环 $ref / 纯兼容新增 / 枚举约束收窄**。
-3. 点击「开始审查 →」。
-4. 结果区提供：
+3. （可选）在「API 标识」输入框填写标识（如 `petstore`）——填写后审查结果才能登记与应用**限时豁免**。
+4. 点击「开始审查 →」。
+5. 结果区提供：
    - 顶部统计卡片与总体结论（✅ 向后兼容 / ❌ N 项破坏性变更）；
+   - **🛡️ 限时豁免面板**（填写 API 标识时）：已豁免 / 未豁免破坏项数量、「未豁免为零才可放行」的放行结论、豁免列表（状态 / 理由 / 到期时间 / 撤销）；
    - **逐条发现 / 根因聚合** 视图切换：聚合视图把同根因的发现折叠为有向影响组（详见下文「🧩 根因聚合视图」）；
    - **级别筛选**：🔴 破坏性 / 🟢 兼容 / 🟡 废弃提示 / ⚪ 信息；
    - **方向筛选**（请求 / 响应 / 结构性）、**分类筛选**、关键字搜索（两种视图均生效）；
-   - 每条发现可展开：人类可读定位、旧/新版 JSON Pointer、`$ref` 锚点、旧值 / 新值、规则编号；
+   - 每条发现可展开：人类可读定位、旧/新版 JSON Pointer、`$ref` 锚点、旧值 / 新值、规则编号；破坏项还可**创建限时豁免**（理由 + UTC 到期时间）；
    - 点击发现项上的 **🌲旧 / 🌲新** 按钮，右侧「引用展开树」自动切到对应版本并展开到该 `$ref`；
    - 每条发现可点击 **📦 导出最小复现包**，下载仅含该发现现场的最小文档对（ZIP，详见下文）；
-   - 「⬇ 下载 Markdown / JSON 报告」获取可归档的审查报告。
-5. 「历史记录」标签页可重新打开、下载或删除保存在 SQLite 中的历史审查；并支持**破坏项对账**：选一条已保存审查作基线，与当前打开的审查比较，输出新增 / 延续 / 已消失三类破坏项（详见下文「⚖️ 破坏项对账」）。
+   - 「⬇ 下载 Markdown / JSON 报告」获取可归档的审查报告（含豁免匹配状态、理由与到期时间）。
+6. 「历史记录」标签页可重新打开、下载或删除保存在 SQLite 中的历史审查；并支持**破坏项对账**：选一条已保存审查作基线，与当前打开的审查比较，输出新增 / 延续 / 已消失三类破坏项（详见下文「⚖️ 破坏项对账」）。
 
 ---
 
@@ -146,10 +148,29 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ---
 
+## 🛡️ 限时豁免
+
+破坏性变更有时需要"临时放行"：客户端已在迁移、灰度期内的计划内破坏等。限时豁免允许对**破坏项**登记一条带**理由**与**未来 UTC 到期时间**的豁免记录，持久保存在 SQLite 中，可随时**撤销**。
+
+**使用方式**：审查前在「API 标识」输入框填写标识（如 `petstore`）→ 执行审查 → 展开某条破坏项 → 点击「🛡️ 创建限时豁免…」→ 填写理由与 UTC 到期时间提交。豁免面板与发现卡片会显示匹配状态（🛡️ 生效中 / ⏰ 已过期 / 🚫 已撤销）、理由与到期时间；生效中的豁免可一键撤销。
+
+**匹配规则**（服务端读取审查时实时重算，不使用发现序号）：
+
+- 豁免按 **API 标识** 共享：同一标识下，规则（`rule_id`）、**方向**、**端点**、**语义位置**（`location`）及**旧值 / 新值**均相同的破坏项才会被覆盖——同一 API 的后续审查自动应用仍有效的豁免；
+- 旧值 / 新值按**规范化 JSON** 比较：**对象键顺序忽略，数组顺序与值类型保留**；
+- **同位置的变更值一旦变化**（如枚举从 `[a,b,c]` 收窄到 `[a,b]` 后又收窄到 `[a]`），旧豁免不再匹配，该破坏项须重新处理；
+- **未填写 API 标识的审查不应用豁免**，也不能创建豁免。
+
+**失效规则**：豁免状态在**每次读取审查时重新计算**——当前时间达到到期时间（`expires_at`，UTC）或已被撤销（`revoked_at` 非空）即失效，该破坏项重新计入未豁免。
+
+**与原始结果的关系**：豁免只是读取时的覆盖层——**原始发现、统计卡片与历史对账保持原样**（对账仍基于全部破坏项）。结果页额外展示**已豁免 / 未豁免破坏项数量**与放行结论：**未豁免破坏项为零才可放行**。Markdown / JSON 报告同样包含豁免匹配状态、理由与到期时间（JSON 中见 `exemption_summary`、`exemptions` 及发现项上的 `exemption` 字段），可直接接入 CI 质量门禁。
+
+---
+
 ## 📦 报告格式
 
-- **Markdown**：结论、统计概览、按严重度排列的明细表（级别/分类/方向/端点/定位/原因），以及可折叠的 JSON Pointer 与旧值/新值附录。
-- **JSON**：结构化结果，包含 `summary` 与全部 `findings`（含 `rule_id`、`severity`、`direction`、`location`、`old_json_path`、`new_json_path`、`old_value`、`new_value` 等），适合接入 CI/CD 质量门禁。
+- **Markdown**：结论、豁免结论（已豁免 / 未豁免破坏项与放行结论）、统计概览、按严重度排列的明细表（级别/分类/方向/端点/定位/原因/豁免状态）、豁免明细表，以及可折叠的 JSON Pointer 与旧值/新值附录。
+- **JSON**：结构化结果，包含 `summary`（原始统计）、`exemption_summary`（已豁免 / 未豁免破坏项数量与 `releasable` 放行结论）、`exemptions`（豁免记录及状态）与全部 `findings`（含 `rule_id`、`severity`、`direction`、`location`、`old_json_path`、`new_json_path`、`old_value`、`new_value` 及匹配到的 `exemption`），适合接入 CI/CD 质量门禁。
 
 ---
 
@@ -202,19 +223,20 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI：审查 / 历史 / 引用树 / 根因聚合 / 破坏项对账 / 报告下载 / 健康检查接口
+│   ├── main.py        # FastAPI：审查 / 历史 / 引用树 / 根因聚合 / 破坏项对账 / 限时豁免 / 报告下载 / 健康检查接口
 │   ├── parser.py      # JSON·YAML 载入与 OpenAPI 3.x 校验
 │   ├── refs.py        # JSON Pointer、$ref 解析、循环安全的引用展开树
 │   ├── diff.py        # 语义兼容性规则引擎（请求/响应双方向）
 │   ├── groups.py      # 根因聚合：端点×方向分区、同源归并、祖先吸收的有向影响组
 │   ├── reconcile.py   # 破坏项对账：稳定身份配对，输出新增 / 延续 / 已消失
+│   ├── exemptions.py  # 限时豁免：规范化 JSON 匹配身份、UTC 到期/撤销状态、读取时叠加
 │   ├── repro.py       # 最小复现包：文档裁剪、$ref 闭包、复核与 ZIP 打包
-│   ├── reports.py     # Markdown / JSON 报告生成
-│   └── database.py    # SQLite 持久化（评审、原文、结果）
+│   ├── reports.py     # Markdown / JSON 报告生成（含豁免匹配状态）
+│   └── database.py    # SQLite 持久化（评审、原文、结果、豁免；启动时自动迁移）
 ├── static/
 │   ├── index.html     # 单页界面
 │   ├── styles.css
-│   ├── app.js         # 原生 JS：筛选 / 聚合视图 / 展开树 / 历史 / 对账 / 下载
+│   ├── app.js         # 原生 JS：筛选 / 聚合视图 / 展开树 / 历史 / 对账 / 豁免 / 下载
 │   └── samples.js     # 四组内置示例（JSON + YAML）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -225,15 +247,17 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/api/reviews` | 提交 `{old_spec, new_spec, ...}` 执行审查并持久化 |
+| `POST` | `/api/reviews` | 提交 `{old_spec, new_spec, api_id?, ...}` 执行审查并持久化（`api_id` 可选，填写后应用限时豁免） |
 | `GET` | `/api/reviews` | 历史审查列表 |
-| `GET` | `/api/reviews/{id}` | 审查详情（含全部 findings） |
-| `DELETE` | `/api/reviews/{id}` | 删除审查 |
-| `GET` | `/api/reviews/{id}/groups` | 根因聚合：有向影响组（稳定组标识 / 主因 / 受影响条目 / 可展开定位） |
-| `GET` | `/api/reviews/{id}/reconcile?baseline_id=N` | 破坏项对账：基线 vs 当前审查，输出新增 / 延续 / 已消失三类破坏项及数量（基线不存在 404、与当前相同 400） |
+| `GET` | `/api/reviews/{id}` | 审查详情（含全部 findings；读取时实时叠加豁免匹配状态与 `exemption_summary`） |
+| `DELETE` | `/api/reviews/{id}` | 删除审查（不影响该 API 标识下的豁免记录） |
+| `POST` | `/api/reviews/{id}/exemptions` | 对破坏项创建限时豁免：`{finding_id, reason, expires_at}`（UTC、须晚于当前时间；无 API 标识 400、非破坏项 422） |
+| `POST` | `/api/exemptions/{eid}/revoke` | 撤销豁免（立即失效，幂等；不存在 404） |
+| `GET` | `/api/reviews/{id}/groups` | 根因聚合：有向影响组（稳定组标识 / 主因 / 受影响条目 / 可展开定位，含豁免状态） |
+| `GET` | `/api/reviews/{id}/reconcile?baseline_id=N` | 破坏项对账：基线 vs 当前审查，输出新增 / 延续 / 已消失三类破坏项及数量（基线不存在 404、与当前相同 400；基于原始发现，不受豁免影响） |
 | `GET` | `/api/reviews/{id}/pointers` | 引用树根节点分组（paths / components） |
 | `GET` | `/api/reviews/{id}/tree?side=old|new&pointer=/...` | 引用展开树（含循环标记） |
-| `GET` | `/api/reviews/{id}/report?format=markdown|json` | 下载报告 |
+| `GET` | `/api/reviews/{id}/report?format=markdown|json` | 下载报告（含豁免匹配状态、理由与到期时间） |
 | `GET` | `/api/reviews/{id}/findings/{fid}/repro` | 导出单条发现的最小复现包（ZIP；复核失败返回 409 及可读原因） |
 | `GET` | `/api/health` | 健康检查（Docker HEALTHCHECK 与编排探活使用） |
 

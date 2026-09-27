@@ -33,6 +33,11 @@
     absorbed: "父路径被整体替换/删除，该发现是其下游影响",
     same_cause: "共享/循环组件在多处引用产生的同一根因",
   };
+  const EX_STATUS = {
+    active: { label: "🛡️ 已豁免", icon: "🛡️" },
+    expired: { label: "⏰ 豁免已过期", icon: "⏰" },
+    revoked: { label: "🚫 豁免已撤销", icon: "🚫" },
+  };
 
   // ------------------------------------------------------------------ //
   // Tab 切换
@@ -123,6 +128,7 @@
           new_spec: newSpec,
           old_filename: $("#old-filename").textContent || null,
           new_filename: $("#new-filename").textContent || null,
+          api_id: $("#api-id-input").value.trim() || null,
         }),
       });
       const data = await resp.json();
@@ -171,7 +177,11 @@
     $("#result-area").classList.remove("hidden");
     $("#result-title").textContent = r.title || `审查 #${r.id}`;
     $("#result-meta").textContent =
-      `记录 #${r.id} · 版本 ${r.old_version || "?"} → ${r.new_version || "?"} · 共 ${r.summary.total} 条变更`;
+      `记录 #${r.id} · 版本 ${r.old_version || "?"} → ${r.new_version || "?"}` +
+      (r.api_id ? ` · API 标识：${r.api_id}` : "") +
+      ` · 共 ${r.summary.total} 条变更`;
+    // 历史审查回填 API 标识，便于基于同一标识再次审查
+    $("#api-id-input").value = r.api_id || "";
 
     const verdict = $("#verdict");
     if (r.summary.compatible) {
@@ -183,6 +193,7 @@
     }
 
     renderStats();
+    renderExemptionPanel();
     populateCategoryFilter();
     bindFiltersOnce();
     syncFilterControls();
@@ -210,6 +221,107 @@
         ? state.review.summary.total
         : (state.review.summary.counts[key] || 0);
     });
+  }
+
+  // ------------------------------------------------------------------ //
+  // 限时豁免（读取时由后端实时重算匹配状态）
+  // ------------------------------------------------------------------ //
+  function renderExemptionPanel() {
+    const panel = $("#exemption-panel");
+    const r = state.review;
+    const es = r.exemption_summary;
+    panel.classList.remove("hidden");
+    if (!r.api_id || !es) {
+      panel.innerHTML = `<div class="exemption-note">ℹ️ 本次审查未填写 API 标识，限时豁免不适用
+        （豁免按 API 标识 + 规则 / 方向 / 端点 / 语义位置 / 新旧值匹配，不使用发现序号）。</div>`;
+      return;
+    }
+    const conclusionCls = es.releasable ? "good" : "bad";
+    const records = (r.exemptions || []).slice().reverse(); // 最新在前
+    const listHtml = records.length
+      ? `<div class="exemption-list">` + records.map((ex) => {
+          const st = EX_STATUS[ex.status] || { label: ex.status };
+          const revokeBtn = ex.status === "active"
+            ? `<button class="mini-link" data-revoke-ex="${ex.id}" title="立即撤销该豁免">撤销</button>` : "";
+          const revokedInfo = ex.revoked_at ? ` · 撤销于 ${escapeHtml(ex.revoked_at)}` : "";
+          return `<div class="exemption-item ${ex.status}">
+            <span class="exemption-badge ${ex.status}">${st.label}</span>
+            <span class="ex-id">#${ex.id}</span>
+            <code class="ex-rule">${escapeHtml(ex.rule_id)}</code>
+            ${ex.endpoint ? `<span class="finding-endpoint">${escapeHtml(ex.endpoint)}</span>` : ""}
+            <span class="ex-loc">📍 ${escapeHtml(ex.location)}</span>
+            <span class="ex-reason" title="豁免理由">💬 ${escapeHtml(ex.reason)}</span>
+            <span class="ex-expires" title="UTC 到期时间，到达即失效">⏳ ${escapeHtml(ex.expires_at)}</span>
+            <span class="ex-matches" title="当前审查中匹配到的破坏项数量">匹配 ${ex.match_count} 项</span>
+            ${revokedInfo ? `<span class="ex-revoked">${revokedInfo}</span>` : ""}
+            ${revokeBtn}
+          </div>`;
+        }).join("") + `</div>`
+      : `<div class="exemption-note">暂无豁免记录。展开下方破坏项详情可登记限时豁免。</div>`;
+    panel.innerHTML = `
+      <div class="exemption-head">
+        <h3>🛡️ 限时豁免</h3>
+        <span class="api-id-tag" title="豁免按此标识跨审查匹配">API：${escapeHtml(es.api_id)}</span>
+      </div>
+      <div class="exemption-stats">
+        <div class="stat-card exempted"><div class="num">${es.exempted_breaking}</div><div class="label">已豁免破坏项</div></div>
+        <div class="stat-card unexempted"><div class="num">${es.unexempted_breaking}</div><div class="label">未豁免破坏项</div></div>
+        <div class="exemption-conclusion ${conclusionCls}">${escapeHtml(es.conclusion)}</div>
+      </div>
+      ${listHtml}`;
+    panel.querySelectorAll("[data-revoke-ex]").forEach((btn) =>
+      btn.addEventListener("click", () => revokeExemption(Number(btn.dataset.revokeEx))));
+  }
+
+  /** 重新拉取当前审查（豁免状态由后端实时重算），保持展开状态重渲染。 */
+  async function reloadReview() {
+    if (!state.review || !state.review.id) return;
+    try {
+      const resp = await fetch(`/api/reviews/${state.review.id}`);
+      if (!resp.ok) return;
+      state.review = await resp.json();
+      renderResult();
+    } catch (_) { /* 网络异常时保留现状 */ }
+  }
+
+  async function createExemption(findingId, form) {
+    const reason = form.querySelector(".ex-reason").value.trim();
+    const dt = form.querySelector(".ex-expires").value; // datetime-local，按 UTC 解释
+    if (!reason) { showError("请填写豁免理由。"); return; }
+    if (!dt) { showError("请选择 UTC 到期时间。"); return; }
+    const expiresAt = dt.length === 16 ? `${dt}:00Z` : `${dt}Z`;
+    try {
+      const resp = await fetch(`/api/reviews/${state.review.id}/exemptions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ finding_id: findingId, reason, expires_at: expiresAt }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        showError(`创建豁免失败：${data.detail || `HTTP ${resp.status}`}`);
+        return;
+      }
+      hideError();
+      await reloadReview();
+    } catch (err) {
+      showError(`创建豁免失败：${err.message}`);
+    }
+  }
+
+  async function revokeExemption(exemptionId) {
+    try {
+      const resp = await fetch(`/api/exemptions/${exemptionId}/revoke`, { method: "POST" });
+      if (!resp.ok) {
+        let msg = `HTTP ${resp.status}`;
+        try { msg = (await resp.json()).detail || msg; } catch (_) { /* 非 JSON */ }
+        showError(`撤销豁免失败：${msg}`);
+        return;
+      }
+      hideError();
+      await reloadReview();
+    } catch (err) {
+      showError(`撤销豁免失败：${err.message}`);
+    }
   }
 
   function populateCategoryFilter() {
@@ -308,7 +420,7 @@
     bindFindingInteractions(list);
   }
 
-  /** 绑定发现卡片内的交互：引用树跳转 + 最小复现包导出（两种视图共用）。 */
+  /** 绑定发现卡片内的交互：引用树跳转 + 最小复现包导出 + 限时豁免（两种视图共用）。 */
   function bindFindingInteractions(root) {
     root.querySelectorAll("[data-tree-pointer]").forEach((el) => {
       el.addEventListener("click", (e) => {
@@ -324,6 +436,26 @@
         downloadRepro(Number(btn.dataset.repro), btn);
       });
     });
+    root.querySelectorAll("[data-exempt-toggle]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const form = root.querySelector(`[data-exempt-form="${btn.dataset.exemptToggle}"]`);
+        if (form) form.classList.toggle("hidden");
+      });
+    });
+    root.querySelectorAll("[data-exempt-submit]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const form = btn.closest("[data-exempt-form]");
+        if (form) createExemption(Number(btn.dataset.exemptSubmit), form);
+      });
+    });
+    root.querySelectorAll("[data-revoke-ex]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        revokeExemption(Number(btn.dataset.revokeEx));
+      });
+    });
   }
 
   function refButtons(f) {
@@ -337,7 +469,36 @@
     ].join("");
   }
 
-  /** 发现详情体：定位 / 双侧指针 / 旧新值 / 规则 / 复现导出（两种视图共用）。 */
+  /** 发现详情中的豁免区块：匹配状态 / 理由 / 到期时间，或创建豁免的内联表单。 */
+  function exemptionBlockHtml(f) {
+    if (f.severity !== "breaking") return "";
+    const ex = f.exemption;
+    if (ex) {
+      const st = EX_STATUS[ex.status] || { label: ex.status };
+      const revokeBtn = ex.status === "active"
+        ? `<button class="mini-link" data-revoke-ex="${ex.id}" title="立即撤销该豁免">撤销豁免</button>` : "";
+      const revokedInfo = ex.revoked_at ? ` · 撤销于 ${escapeHtml(ex.revoked_at)}` : "";
+      return `<div class="exemption-box ${ex.status}">
+        <span class="exemption-badge ${ex.status}">${st.label}</span>
+        <span class="ex-reason">💬 理由：${escapeHtml(ex.reason)}</span>
+        <span class="ex-expires">⏳ 到期：${escapeHtml(ex.expires_at)}（UTC）${revokedInfo}</span>
+        ${revokeBtn}
+      </div>`;
+    }
+    if (!state.review.api_id) return "";
+    return `<div class="exemption-box none">
+      <button class="mini-link" data-exempt-toggle="${f.id}"
+        title="登记限时豁免：同一 API 标识下规则 / 方向 / 端点 / 语义位置 / 新旧值均相同的破坏项才会被覆盖">🛡️ 创建限时豁免…</button>
+      <div class="exemption-form hidden" data-exempt-form="${f.id}">
+        <input type="text" class="ex-reason" placeholder="豁免理由（必填），如：客户端已迁移，灰度期临时放行" />
+        <input type="datetime-local" class="ex-expires" title="UTC 到期时间，到达即自动失效" />
+        <span class="ex-utc-hint">UTC 到期</span>
+        <button class="mini-btn primary-mini" data-exempt-submit="${f.id}">提交豁免</button>
+      </div>
+    </div>`;
+  }
+
+  /** 发现详情体：定位 / 双侧指针 / 旧新值 / 规则 / 豁免 / 复现导出（两种视图共用）。 */
   function findingBodyHtml(f) {
     const hasValues = f.old_value !== null || f.new_value !== null;
     const oldVal = hasValues
@@ -358,6 +519,7 @@
       </div>
       ${hasValues ? `<div class="value-diff">${oldVal}${newVal}</div>` : ""}
       <div class="rule-id">rule: ${escapeHtml(f.rule_id)} · 方向：${DIRECTION_LABEL[f.direction] || f.direction} · 分类：${escapeHtml(f.category)}</div>
+      ${exemptionBlockHtml(f)}
       <div class="repro-row">
         <button class="mini-link repro-btn" data-repro="${f.id}"
           title="裁剪新旧文档，仅保留该发现所属路径/操作及其传递引用的组件，打包 ZIP 下载">📦 导出最小复现包</button>
@@ -367,11 +529,14 @@
 
   function findingCard(f) {
     const bodyHidden = state.expandedFinding === f.id ? "" : "hidden";
+    const exBadge = f.exemption
+      ? `<span class="exemption-badge ${f.exemption.status}" title="豁免匹配状态">${(EX_STATUS[f.exemption.status] || {}).label || ""}</span>` : "";
 
     return `
     <article class="finding ${f.severity}" data-id="${f.id}">
       <div class="finding-head">
         <span class="finding-badge">${SEV_LABEL[f.severity] || f.severity}</span>
+        ${exBadge}
         ${f.endpoint ? `<span class="finding-endpoint">${escapeHtml(f.endpoint)}</span>` : ""}
         <p class="finding-msg">${escapeHtml(f.message)}</p>
         <span class="finding-meta">
@@ -782,7 +947,7 @@
         <tr>
           <td>${it.id}</td>
           <td>${escapeHtml(it.created_at || "")}</td>
-          <td>${escapeHtml(it.title || "")}</td>
+          <td>${escapeHtml(it.title || "")}${it.api_id ? ` <span class="api-id-tag" title="该审查已设置 API 标识，可应用限时豁免">${escapeHtml(it.api_id)}</span>` : ""}</td>
           <td>${escapeHtml(it.old_version || "?")} → ${escapeHtml(it.new_version || "?")}</td>
           <td><span class="pill ${it.summary.compatible ? "good" : "bad"}">
             ${it.summary.compatible ? "兼容" : `${c.breaking || 0} 破坏`}

@@ -65,6 +65,10 @@
           <button class="link-btn" data-sample="enum">枚举/约束收窄</button>
         </div>
         <div class="actions-right">
+          <label class="api-id-box" title="填写后，审查结果可对破坏项登记限时豁免；豁免按 API 标识跨审查匹配">
+            API 标识
+            <input type="text" id="api-id-input" placeholder="可选，用于限时豁免，如 petstore" />
+          </label>
           <button id="clear-btn" class="ghost-btn">清空</button>
           <button id="compare-btn" class="primary-btn">开始审查 →</button>
         </div>
@@ -87,6 +91,9 @@
         </div>
 
         <div class="stat-cards" id="stat-cards"></div>
+
+        <!-- 限时豁免面板：已豁免 / 未豁免破坏项数量与放行结论、豁免列表 -->
+        <div id="exemption-panel" class="exemption-panel hidden"></div>
 
         <div class="filters">
           <div class="filter-group" id="severity-filters">
